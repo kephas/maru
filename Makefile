@@ -1,11 +1,11 @@
 NOW = $(shell date '+%Y%m%d.%H%M')
-SYS = $(shell uname -o)
+SYS = $(shell uname)
 
 OFLAGS = -O3 -fomit-frame-pointer -DNDEBUG
 CFLAGS = -Wall -g $(OFLAGS)
 CC32 = $(CC) -m32
 
-ifeq "$(SYS)" "Msys"
+ifeq ($(findstring MINGW32,$(SYS)),MINGW32)
 LIBS = -lm libw32dl.a
 else
 LIBS = -lm -ldl
@@ -164,7 +164,7 @@ stats : .force
 
 clean : .force
 	rm -f irl.g.l sirl.g.l osdefs.k test.c tpeg.l a.out
-	rm -f *~ *.o main eval eval32 gceval test *.s mkosdefs
+	rm -f *~ *.o main eval eval32 gceval test *.s mkosdefs *.exe
 	rm -rf *.dSYM *.mshark
 
 #----------------------------------------------------------------
