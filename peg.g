@@ -61,6 +61,7 @@ sexpr		= ("-"? digit+) @$#
 		| "?".
 		| "\""  (!"\""  char)* $:e "\""					-> e
 		| "("  sexpression*:e (space dot sexpression:f)? sspace ")"	-> (set-list-source `(,@e ,@f) e)
+		| "["  sexpression*:e (space dot sexpression:f)? sspace "]"	-> (set-list-source `(bracket ,@e ,@f) e)
 		| "'"  sexpression:e						-> (list 'quote e)
 		| "`"  sexpression:e						-> (list 'quasiquote e)
 		| ",@" sexpression:e						-> (list 'unquote-splicing e)
@@ -112,29 +113,50 @@ expression	= sequence:s	( (bar sequence)+:t		-> `(match-first ,s ,@t)
 				|				-> s
 				) ;
 
-definition	= space identifier:id equals expression:e ";"	-> `(,id ,e) ;
+parameters	= (colon identifier)* ;
 
-start		= definition ;
+definition	= space identifier:id parameters:p
+		  equals expression:e ";"			-> `(,id ,e ,p) ;
+
+definitions	= definition* ;
+
+start		= (parser_class | definitions):result
+		  ;
+
+varname		= symbol:s space -> s ;
+
+parser_decl	= space varname:name colon varname:parent lparen (varname*):vars rparen	-> `(,name ,parent ,vars) ;
+
+parser_class	= parser_decl:decl
+		  definition*:definitions
+		  space (!. |					-> (error "error in grammar near: "(parser-stream-context self.source))
+                        )
+		  {gen_cola_parser (car decl) (cadr decl) (caddr decl) definitions}
+		;
+
+parser_spec	= parser_decl?:decl definition*:defns		-> `(,decl ,@defns) ;
 
 #----------------------------------------------------------------
 
+gen_cola_parser	= .:name .:parent .:vars .:definitions		-> (set (<peg>-grammar-name self) name)
+		  {gen_cola definitions}:definitions		-> `((define-class ,name ,parent ,vars) ,@definitions) ;
 
 gen_cola		= &gen_cola_value_declarations:a
 			  &gen_cola_effect_declarations:b
 			  &gen_cola_value_definitions:c
 			   gen_cola_effect_definitions:d	-> `( ,@a ,@b ,@c ,@d ) ;
 
-gen_cola_value_declarations	= gen_cola_value_declaration* ;
-gen_cola_effect_declarations	= gen_cola_effect_declaration* ;
+gen_cola_value_declarations	= `( gen_cola_value_declaration* :d ) -> d ;
+gen_cola_effect_declarations	= `( gen_cola_effect_declaration*:d ) -> d ;
 
 gen_cola_value_declaration	= `( .:id )			-> `(define-selector ,(concat-symbol '$ id)) ;
 gen_cola_effect_declaration	= `( .:id )			-> `(define-selector ,(concat-symbol '$$ id)) ;
 
-gen_cola_value_definitions	= gen_cola_value_definition* ;
-gen_cola_effect_definitions	= gen_cola_effect_definition* ;
+gen_cola_value_definitions	= `( gen_cola_value_definition* :d ) -> d ;
+gen_cola_effect_definitions	= `( gen_cola_effect_definition*:d ) -> d ;
 
-gen_cola_value_definition	= `( .:id &{findvars ()}:vars value:exp )  -> `(define-method ,(concat-symbol '$ id) <peg> () (let ,vars ,exp)) ;
-gen_cola_effect_definition	= `( .:id &{findvars ()}:vars effect:exp ) -> `(define-method ,(concat-symbol '$$ id) <peg> () (let ,vars ,exp)) ;
+gen_cola_value_definition	= `( .:id &{findvars ()}:vars value:exp )  -> `(peg-define-rule ,(concat-symbol  '$ id) ,(<peg>-grammar-name self) ,vars ,exp) ;
+gen_cola_effect_definition	= `( .:id &{findvars ()}:vars effect:exp ) -> `(peg-define-rule ,(concat-symbol '$$ id) ,(<peg>-grammar-name self) ,vars ,exp) ;
 
 findvars = .:vars `( 'assign-result .:name {findvars vars}:vars		   -> (if (assq name vars) vars (cons (cons name) vars))
 		   | 'result-expr		-> vars
@@ -143,19 +165,19 @@ findvars = .:vars `( 'assign-result .:name {findvars vars}:vars		   -> (if (assq
 		   ) ;
 
 value =
-`( 'match-rule .:name .+:args		-> `(let ()
+`( 'match-rule .:name .+:args		-> `(let ((pos (<parser-stream>-position self.source)))
    	       	      			      ,@(map (lambda (arg) (list 'parser-stream-push 'self.source arg)) args)
-					      (or (,(concat-symbol '$ name) self)
-					      (let () (set (<parser-stream>-position self.source) pos) ())))
- | 'match-rule .:name			-> `(,(concat-symbol '$ name) self)
+					      (or (peg-match-rule ,(concat-symbol '$ name) self)
+						  (let () (set (<parser-stream>-position self.source) pos) ())))
+ | 'match-rule .:name			-> `(peg-match-rule ,(concat-symbol '$ name) self)
  | 'match-rule-in .:type .:name .+:args	-> `(let ((pos (<parser-stream>-position self.source))
 						  (_p  (parser ,(concat-symbol '< (concat-symbol type '>)) self.source)))
   					        ,@(map (lambda (arg) (list 'parser-stream-push 'self.source arg)) args)
-  						(if (,(concat-symbol '$ name) _p)
+  						(if (peg-match-rule ,(concat-symbol '$ name) _p)
 						    (let () (set self.result (<parser>-result _p)) 1)
 						  (let () (set (<parser-stream>-position self.source) pos) ())))
  | 'match-rule-in .:type .:name		-> `(let ((_p  (parser ,(concat-symbol '< (concat-symbol type '>)) self.source)))
-					      (and (,(concat-symbol '$ name) _p)
+					      (and (peg-match-rule ,(concat-symbol '$ name) _p)
 						   (let () (set self.result (<parser>-result _p)) 1)))
  | 'match-first value+:exps		-> `(or ,@exps)
  | 'match-all (&(..) effect)*:e value:v	-> `(let ((pos (<parser-stream>-position self.source)))
@@ -200,24 +222,24 @@ value =
  | 'make-symbol value:exp		-> `(and ,exp (set self.result (string->symbol (list->string self.result))))
  | 'make-number .:r value:exp		-> `(and ,exp (set self.result (string->number-base (list->string self.result) ,r)))
  | 'assign-result .:name value:exp	-> `(and ,exp (let () (set ,name self.result) 1))
- | 'result-expr .:exp			-> `(let () (set self.result ,exp) 1)
+ | 'result-expr .:exp			-> `(let () (peg-source-range-begin self) (set self.result ,exp) (peg-source-range-end self) 1)
  | .:op					->  (error "cannot generate value for "op)
  |					->  (error "cannot generate value for nil")
  ) ;
 
 effect =
-`( 'match-rule .:name .+:args		-> `(let ()
+`( 'match-rule .:name .+:args		-> `(let ((pos (<parser-stream>-position self.source)))
    	       	      			      ,@(map (lambda (arg) (list 'parser-stream-push 'self.source arg)) args)
-					      (or (,(concat-symbol '$$ name) self)
+					      (or (peg-match-rule ,(concat-symbol '$$ name) self)
 					      (let () (set (<parser-stream>-position self.source) pos) ())))
- | 'match-rule .:name			-> `(,(concat-symbol '$$ name) self)
+ | 'match-rule .:name			-> `(peg-match-rule ,(concat-symbol '$$ name) self)
  | 'match-rule-in .:type .:name .+:args	-> `(let ((pos (<parser-stream>-position self.source)))
          				      (let ()
   					        ,@(map (lambda (arg) (list 'parser-stream-push 'self.source arg)) args)
-  						(or (,(concat-symbol '$$ name)
+  						(or (peg-match-rule ,(concat-symbol '$$ name)
 						      (parser ,(concat-symbol '< (concat-symbol type '>)) self.source))
 						    (let () (set (<parser-stream>-position self.source) pos) ()))))
- | 'match-rule-in .:type .:name		-> `(,(concat-symbol '$$ name)
+ | 'match-rule-in .:type .:name		-> `(peg-match-rule ,(concat-symbol '$$ name)
 					      (parser ,(concat-symbol '< (concat-symbol type '>)) self.source))
  | 'match-first     effect+:exps	-> `(or ,@exps)
  | 'match-all       effect*:e		-> `(let ((pos (<parser-stream>-position self.source)))
@@ -245,7 +267,7 @@ effect =
  | 'make-symbol   effect:exp		->  exp
  | 'make-number .:r effect:exp		->  exp
  | 'assign-result .:name value:exp	-> `(and ,exp (let () (set ,name self.result) 1))
- | 'result-expr   .:exp			-> `(let () ,exp 1)
+ | 'result-expr   .:exp			-> `(let () (peg-source-range-begin self) ,exp (peg-source-range-end self) 1)
  | .:op					->  (error "cannot generate value for "op)
  |					->  (error "cannot generate value for nil")
  ) ;

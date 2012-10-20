@@ -1,19 +1,27 @@
+NOW = $(shell date '+%Y%m%d.%H%M')
+
 OFLAGS = -O3 -fomit-frame-pointer -DNDEBUG
 CFLAGS = -Wall -g $(OFLAGS)
 CC32 = $(CC) -m32
 
 .SUFFIXES :
 
-all : eval
+all : eval eval32 osdefs.k
 
-run : eval
+run : all
 	rlwrap ./eval
 
 eval : eval.c gc.c gc.h buffer.c chartab.h wcs.c
 	$(CC) -g $(CFLAGS) -o eval eval.c -lm -ldl
+	@-test ! -x /usr/sbin/execstack || /usr/sbin/execstack -s $@
+
+eval32 : eval.c gc.c gc.h buffer.c chartab.h wcs.c
+	$(CC32) -g $(CFLAGS) -o eval32 eval.c -lm -ldl
+	@-test ! -x /usr/sbin/execstack || /usr/sbin/execstack -s $@
 
 gceval : eval.c libgc.c buffer.c chartab.h wcs.c
 	$(CC) -g $(CFLAGS) -DLIB_GC=1 -o gceval eval.c -lm -ldl -lgc
+	@-test ! -x /usr/sbin/execstack || /usr/sbin/execstack -s $@
 
 debug : .force
 	$(MAKE) OFLAGS="-O0"
@@ -26,6 +34,12 @@ profile : .force
 #	shark -q -1 -i ./eval emit.l eval.l eval.l eval.l eval.l eval.l eval.l eval.l eval.l eval.l eval.l > test.s
 	shark -q -1 -i ./eval repl.l test-pepsi.l
 
+osdefs.k : mkosdefs
+	./mkosdefs > $@
+
+mkosdefs : mkosdefs.c
+	$(CC) -o $@ $<
+
 cg : eval .force
 	./eval codegen5.l | tee test.s
 	as test.s
@@ -33,13 +47,13 @@ cg : eval .force
 	./test
 
 test : emit.l eval.l eval
-	time ./emit.l eval.l > test.s && $(CC32) -c -o test.o test.s && size test.o && $(CC32) -o test test.o
+	time ./eval -O emit.l eval.l > test.s && $(CC32) -c -o test.o test.s && size test.o && $(CC32) -o test test.o
 
 time : .force
-	time ./eval emit.l eval.l eval.l eval.l eval.l eval.l > /dev/null
+	time ./eval -O emit.l eval.l eval.l eval.l eval.l eval.l > /dev/null
 
 test2 : test .force
-	time ./test boot.l emit.l eval.l > test2.s
+	time ./test -O boot.l emit.l eval.l > test2.s
 	diff test.s test2.s
 
 time2 : .force
@@ -68,6 +82,67 @@ test-peg : eval peg.l .force
 	time ./eval parser.l peg.n test-peg.l > peg.m
 	diff peg.n peg.m
 
+test-compile-grammar :
+	./eval compile-grammar.l test-dc.g > test-dc.g.l
+	./eval compile-dc.l test.dc
+
+test-compile-irl : eval32 irl.g.l .force
+	./eval compile-irl.l test.irl > test.c
+	$(CC32) -fno-builtin -g -o test test.c
+	@echo
+	./test
+
+irl.g.l : tpeg.l irl.g
+	./eval compile-tpeg.l irl.g > irl.g.l
+
+test-compile-sirl : eval32 sirl.g.l .force
+	./eval compile-sirl.l test.sirl > test.c
+	$(CC32) -fno-builtin -g -o test test.c
+	@echo
+	./test
+
+sirl.g.l : tpeg.l sirl.g
+	./eval compile-tpeg.l sirl.g > sirl.g.l
+
+test-ir : eval .force
+	./eval test-ir.k > test.c
+	$(CC32) -fno-builtin -g -o test test.c
+	@echo
+	./test
+
+tpeg.l : tpeg.g compile-peg.l compile-tpeg.l
+	time ./eval compile-peg.l  tpeg.g > tpeg.l.new
+	-test -f tpeg.l && cp tpeg.l tpeg.l.$(NOW)
+	mv tpeg.l.new tpeg.l
+	time ./eval compile-tpeg.l tpeg.g > tpeg.ll
+	sort tpeg.l > tpeg.ls
+	sort tpeg.ll > tpeg.lls
+	diff tpeg.ls tpeg.lls
+	rm tpeg.ls tpeg.ll tpeg.lls
+
+test-mach-o : eval32 .force
+	./eval32 test-mach-o.l
+	@echo
+	size a.out
+	chmod +x a.out
+	@echo
+	./a.out
+
+test-elf : eval32 .force
+	./eval32 test-elf.l
+	@echo
+	size a.out
+	chmod +x a.out
+	@echo
+	./a.out
+
+test-assembler : eval32 .force
+	./eval32 assembler.k
+
+test-recursion2 :
+	./eval compile-grammar.l test-recursion2.g > test-recursion2.g.l
+	./eval compile-recursion2.l test-recursion2.txt
+
 profile-peg : .force
 	$(MAKE) clean eval CFLAGS="-O3 -fno-inline-functions -g -DNDEBUG"
 	shark -q -1 -i ./eval parser.l peg.n test-peg.l > peg.m
@@ -78,7 +153,8 @@ stats : .force
 	cat boot.l emit.l eval.l | sed 's/.*debug.*//;s/;.*//' | sort -u | wc -l
 
 clean : .force
-	rm -f *~ *.o main eval gceval test *.s
+	rm -f irl.g.l sirl.g.l osdefs.k test.c tpeg.l a.out
+	rm -f *~ *.o main eval eval32 gceval test *.s mkosdefs
 	rm -rf *.dSYM *.mshark
 
 #----------------------------------------------------------------
@@ -89,8 +165,6 @@ FILES = Makefile \
 	parser.l peg-compile.l peg-compile-2.l peg-boot.l peg.l test-peg.l test-repl.l \
 	repl.l repl-2.l mpl.l sim.l \
 	peg.g
-
-NOW = $(shell date '+%Y%m%d.%H%M')
 
 DIST = maru-$(NOW)
 DEST = ckpt/$(DIST)

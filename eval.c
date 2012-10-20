@@ -1,6 +1,7 @@
-// last edited: 2011-12-13 14:12:22 by piumarta on emilia
+// last edited: 2012-08-20 07:20:08 by piumarta on emilia
 
 #define _ISOC99_SOURCE 1
+#define _BSD_SOURCE 1
 
 #include <stdio.h>
 #include <string.h>
@@ -49,7 +50,7 @@ struct Expr	{ oop 	   name, defn, ctx, profile; };
 struct Form	{ oop 	   function, symbol; };
 struct Fixed	{ oop      function; };
 struct Subr	{ imp_t    imp;  wchar_t *name;  int profile; };
-struct Variable	{ oop 	   name, value, env, index; };
+struct Variable	{ oop 	   name, value, env, index, type; };
 struct Env	{ oop 	   parent, level, offset, bindings, stable; };
 struct Context	{ oop 	   home, env, bindings, callee, pc; };
 
@@ -111,8 +112,8 @@ static oop cadr(oop obj)		{ return car(cdr(obj)); }
 static oop cddr(oop obj)		{ return cdr(cdr(obj)); }
 //static oop caaar(oop obj)		{ return car(car(car(obj))); }
 //static oop cadar(oop obj)		{ return car(cdr(car(obj))); }
-//static oop caddr(oop obj)		{ return car(cdr(cdr(obj))); }
-//static oop cadddr(oop obj)		{ return car(cdr(cdr(cdr(obj)))); }
+static oop caddr(oop obj)		{ return car(cdr(cdr(obj))); }
+static oop cadddr(oop obj)		{ return car(cdr(cdr(cdr(obj)))); }
 
 #define newBits(TYPE)	_newBits(TYPE, sizeof(struct TYPE))
 #define newOops(TYPE)	_newOops(TYPE, sizeof(struct TYPE))
@@ -121,12 +122,15 @@ static oop _newBits(int type, size_t size)	{ oop obj= GC_malloc_atomic(size);	se
 static oop _newOops(int type, size_t size)	{ oop obj= GC_malloc(size);		setType(obj, type);  return obj; }
 
 static oop symbols= nil;
-static oop s_define= nil, s_set= nil, s_quote= nil, s_lambda= nil, s_let= nil, s_quasiquote= nil, s_unquote= nil, s_unquote_splicing= nil, s_t= nil, s_dot= nil; //, s_in= nil;
+static oop s_define= nil, s_set= nil, s_quote= nil, s_lambda= nil, s_let= nil, s_quasiquote= nil, s_unquote= nil, s_unquote_splicing= nil, s_t= nil, s_dot= nil, s_bracket= nil, s_brace= nil; //, s_in= nil;
 static oop f_lambda= nil, f_let= nil, f_quote= nil, f_set= nil, f_define;
 static oop globals= nil, expanders= nil, encoders= nil, evaluators= nil, applicators= nil;
-static oop arguments= nil, backtrace= nil, input= nil;
+static oop arguments= nil, backtrace= nil, input= nil, output= nil;
 
-static int opt_b= 0, opt_g= 0, opt_p= 0, opt_v= 0;
+static int opt_b= 0, opt_g= 0, opt_O= 0, opt_p= 0, opt_v= 0;
+
+static oop traceStack= nil;
+static int traceDepth= 0;
 
 static oop newData(size_t len)		{ return _newBits(Data, len); }
 
@@ -158,12 +162,16 @@ static oop _newString(size_t len)
   return obj;
 }
 
-static oop newString(wchar_t *cstr)
+static oop newStringN(wchar_t *cstr, size_t len)
 {
-  size_t len= wcslen(cstr);
   oop obj= _newString(len);
   memcpy(get(obj, String,bits), cstr, sizeof(wchar_t) * len);
   return obj;
+}
+
+static oop newString(wchar_t *cstr)
+{
+    return newStringN(cstr, wcslen(cstr));
 }
 
 static int stringLength(oop string)
@@ -295,7 +303,8 @@ static oop newVariable(oop name, oop value, oop env, int index)
   set(obj, Variable,name,  name);
   set(obj, Variable,value, value);
   set(obj, Variable,env,   env);
-  set(obj, Variable,index, newLong(index));	GC_UNPROTECT(obj);
+  set(obj, Variable,index, newLong(index));
+  set(obj, Variable,type,  0);			GC_UNPROTECT(obj);
   return obj;
 }
 
@@ -321,11 +330,14 @@ static oop newBaseContext(oop home, oop caller, oop env)
 static oop newContext(oop home, oop caller, oop env)
 {
   oop obj= nil;
+  //xxx fix escape analysis for nested lambdas with free variables
+#if 0
   if ((nil != caller) && (nil != (obj= get(caller, Context,callee)))) {
     set(obj, Context,home, home);
     set(obj, Context,env,  env);
     return obj;
   }
+#endif
   obj= newBaseContext(home, caller, env);
   if (nil != caller) set(caller, Context,callee, obj);
   return obj;
@@ -334,25 +346,26 @@ static oop newContext(oop home, oop caller, oop env)
 static void dump(oop);
 static void dumpln(oop);
 
-static oop findVariable(oop env, oop name)
+static oop findLocalVariable(oop env, oop name)
 {
-//  if (is(Pair, name) && s_in == getHead(name)) {
-//    env= findVariable(env, cadr(name));
-//    if (nil == env) fatal("undefined namespace: %s", get(cadr(name), Symbol,bits));
-//    if (!is(Env, env)) fatal("not a namespace: %s", get(cadr(name), Symbol,bits));
-//    return findVariable(env, caddr(name));
-//  }
-  while (nil != env) {
     oop bindings= get(env, Env,bindings);
     int index= arrayLength(bindings);
     while (--index >= 0) {
-      oop var= arrayAt(bindings, index);
-      if (get(var, Variable,name) == name)
-	return var;
+	oop var= arrayAt(bindings, index);
+	if (get(var, Variable,name) == name)
+	    return var;
     }
-    env= get(env, Env,parent);
-  }
-  return nil;
+    return nil;
+}
+
+static oop findVariable(oop env, oop name)
+{
+    while (nil != env) {
+	oop var= findLocalVariable(env, name);
+	if (nil != var) return var;
+	env= get(env, Env,parent);
+    }
+    return nil;
 }
 
 static oop lookup(oop env, oop name)
@@ -689,8 +702,18 @@ static oop read(FILE *fp)
 	return obj;
       }
       case '(': return readList(fp, ')');      case ')': ungetwc(c, fp);  return DONE;
-      case '[': return readList(fp, ']');      case ']': ungetwc(c, fp);  return DONE;
-      case '{': return readList(fp, '}');      case '}': ungetwc(c, fp);  return DONE;
+      case '[': {
+	  oop obj= readList(fp, ']');			GC_PROTECT(obj);
+	  obj= newPairFrom(s_bracket, obj, obj);	GC_UNPROTECT(obj);
+	  return obj;
+      }
+      case ']': ungetwc(c, fp);  return DONE;
+      case '{': {
+	  oop obj= readList(fp, '}');			GC_PROTECT(obj);
+	  obj= newPairFrom(s_brace, obj, obj);		GC_UNPROTECT(obj);
+	  return obj;
+      }
+      case '}': ungetwc(c, fp);  return DONE;
       case '-': {
 	wint_t d= getwc(fp);
 	ungetwc(d, fp);
@@ -736,7 +759,7 @@ static oop read(FILE *fp)
     }
   }
 }
-    
+
 static void doprint(FILE *stream, oop obj, int storing)
 {
   if (!obj) {
@@ -750,9 +773,9 @@ static void doprint(FILE *stream, oop obj, int storing)
   switch (getType(obj)) {
     case Undefined:	fprintf(stream, "UNDEFINED");		break;
     case Data: {
-	int i, j= GC_size(obj);
+	//int i, j= GC_size(obj);
 	fprintf(stream, "<data[%i]", (int)GC_size(obj));
-	for (i= 0;  i < j;  ++i) fprintf(stream, " %02x", ((unsigned char *)obj)[i]);
+	//for (i= 0;  i < j;  ++i) fprintf(stream, " %02x", ((unsigned char *)obj)[i]);
 	fprintf(stream, ">");
 	break;
     }
@@ -766,11 +789,11 @@ static void doprint(FILE *stream, oop obj, int storing)
 	int c;
 	putc('"', stream);
 	while ((c= *p++)) {
-	  if (c >= ' ' && c < 127)
+	  if (c >= ' ')
 	    switch (c) {
 	      case '"':  printf("\\\"");  break;
 	      case '\\': printf("\\\\");  break;
-	      default:	 putc(c, stream);  break;
+	      default:	 putwc(c, stream);  break;
 	    }
 	  else fprintf(stream, "\\%03o", c);
 	}
@@ -791,11 +814,13 @@ static void doprint(FILE *stream, oop obj, int storing)
       fprintf(stream, "(");
       for (;;) {
 	assert(is(Pair, obj));
+#if defined(NDEBUG)
 	if (is(Env, getHead(obj))) {
 	  obj= getTail(obj);
 	  if (!is(Pair, obj)) break;
 	  continue;
 	}
+#endif
 	doprint(stream, getHead(obj), storing);
 	obj= getTail(obj);
 	if (!is(Pair, obj)) break;
@@ -860,7 +885,7 @@ static void doprint(FILE *stream, oop obj, int storing)
       if (!isGlobal(obj) && isatty(1)) fprintf(stream, "[4m");
       doprint(stream, get(obj, Variable,name), 0);
       if (!isGlobal(obj) && isatty(1)) fprintf(stream, "[m");
-#if 0
+#if !defined(NDEBUG)
       oop env= get(obj, Variable,env);
       if (nil != env) fprintf(stream, ";%ld+%ld", getLong(get(env, Env,level)), getLong(get(obj, Variable,index)));
 #endif
@@ -1004,23 +1029,59 @@ static oop exlist(oop list, oop env)
 
 static oop enlist(oop obj, oop env);
 
+static void define_bindings(oop bindings, oop innerEnv)
+{										GC_PROTECT(bindings);
+    while (is(Pair, bindings))
+    {
+	oop var= getHead(bindings);						GC_PROTECT(var);
+	if (!is(Symbol, var)) var= car(var);
+	var= define(innerEnv, var, nil);					GC_UNPROTECT(var);
+	bindings= getTail(bindings);
+    }										GC_UNPROTECT(bindings);
+}
+
+static oop encode_bindings(oop expr, oop bindings, oop outerEnv, oop innerEnv)
+{
+    if (is(Pair, bindings))
+    {										GC_PROTECT(bindings);
+	oop binding= getHead(bindings);						GC_PROTECT(binding);
+	if (is(Symbol, binding))
+	    binding= newPairFrom(binding, nil, expr);
+	oop var= car(binding);							GC_PROTECT(var);
+	oop val= cdr(binding);							GC_PROTECT(val);
+	var= findLocalVariable(innerEnv, var);					assert(nil != var);
+	val= enlist(val, outerEnv);
+	binding= newPairFrom(var, val, expr);					GC_UNPROTECT(val);  GC_UNPROTECT(var);
+	oop rest= encode_bindings(expr, getTail(bindings), outerEnv, innerEnv);
+	bindings= newPairFrom(binding, rest, expr);				GC_UNPROTECT(binding);
+										GC_UNPROTECT(bindings);
+    }
+    return bindings;
+}
+
+static oop encode_let(oop expr, oop tail, oop env)
+{
+    oop args= car(tail);					GC_PROTECT(tail);  GC_PROTECT(env);
+    oop env2= newEnv(env, 0, getLong(get(env, Env,offset)));	GC_PROTECT(env2);
+    define_bindings(args, env2);
+    set(env, Env,offset, newLong(getLong(get(env2, Env,offset))));
+    oop bindings= encode_bindings(expr, args, env, env2);	GC_PROTECT(bindings);
+    oop body= cdr(tail);					GC_PROTECT(body);
+    body= enlist(body, env2);
+    tail= newPairFrom(bindings, body, expr);			GC_UNPROTECT(body);  GC_UNPROTECT(bindings);
+    tail= newPairFrom(env2, tail, expr);			GC_UNPROTECT(env2);  GC_UNPROTECT(env);  GC_UNPROTECT(tail);
+    return tail;
+}
+
 static oop encode(oop expr, oop env)
 {
+  if (opt_O < 2) arrayAtPut(traceStack, traceDepth++, expr);
   if (opt_v > 1) { printf("ENCODE ");  dumpln(expr); }
   if (is(Pair, expr)) {
     oop head= encode(getHead(expr), env);			GC_PROTECT(head);
     oop tail= getTail(expr);					GC_PROTECT(tail);
     if (f_let == head) { // (let ENV (bindings...) . body)
-      oop args= cadr(expr);
-      env= newEnv(env, 0, getLong(get(env, Env,offset)));	GC_PROTECT(env);
-      while (is(Pair, args)) {
-	oop var= getHead(args);
-	if (is(Pair, var)) var= getHead(var);
-	define(env, var, nil);
-	args= getTail(args);
-      }
-      tail= enlist(tail, env);
-      tail= newPairFrom(env, tail, expr);			GC_UNPROTECT(env);
+	tail= encode_let(expr, tail, env);
     }
     else if (f_lambda == head) { // (lambda ENV params . body)
       oop args= car(tail);
@@ -1084,6 +1145,7 @@ static oop encode(oop expr, oop env)
     }
   }
   if (opt_v > 1) { printf("ENCODE => ");  dumpln(expr); }
+  --traceDepth;
   return expr;
 }
 
@@ -1098,10 +1160,7 @@ static oop enlist(oop list, oop env)
 
 static oop evlist(oop obj, oop env);
 
-static oop traceStack= nil;
-static int traceDepth= 0;
-
-static int printSource(oop exp)
+static int fprintSource(FILE *stream, oop exp)
 {
     if (is(Pair, exp)) {
 	oop src= get(exp, Pair,source);
@@ -1109,11 +1168,16 @@ static int printSource(oop exp)
 	    oop path= car(src);
 	    oop line= cdr(src);
 	    if (is(String, path) && is(Long, line)) {
-		return printf("%ls:%ld", get(path, String,bits), getLong(line));
+		return fprintf(stream, "%ls:%ld", get(path, String,bits), getLong(line));
 	    }
 	}
     }
     return 0;
+}
+
+static int printSource(oop exp)
+{
+    return fprintSource(stdout, exp);
 }
 
 static void fatal(char *reason, ...)
@@ -1136,20 +1200,25 @@ static void fatal(char *reason, ...)
     apply(tracer, args, nil);			GC_UNPROTECT(args);
   }
   else {
-    int i= traceDepth;
-    int j= 12;
-    while (i--) {
-      //printf("%3d: ", i);
-      oop exp= arrayAt(traceStack, i);
-      printf("[32m[?7l");
-      int l= printSource(exp);
-      if (l >= j) j= l;
-      if (!l) while (l < 3) l++, putchar('.');
-      while (l++ < j) putchar(' ');
-      printf("[0m ");
-      dumpln(arrayAt(traceStack, i));
-      printf("[?7h");
-    }
+      if (traceDepth) {
+	  int i= traceDepth;
+	  int j= 12;
+	  while (i-- > 0) {
+	      //printf("%3d: ", i);
+	      oop exp= arrayAt(traceStack, i);
+	      printf("[32m[?7l");
+	      int l= printSource(exp);
+	      if (l >= j) j= l;
+	      if (!l) while (l < 3) l++, putchar('.');
+	      while (l++ < j) putchar(' ');
+	      printf("[0m ");
+	      dumpln(arrayAt(traceStack, i));
+	      printf("[?7h");
+	  }
+      }
+      else {
+	  printf("no backtrace\n");
+      }
   }
   exit(1);
 }
@@ -1165,7 +1234,7 @@ static oop eval(oop obj, oop ctx)
       return obj;
     }
     case Pair: {
-      arrayAtPut(traceStack, traceDepth++, obj);
+      if (opt_O < 2) arrayAtPut(traceStack, traceDepth++, obj);
       oop head= eval(getHead(obj), ctx);		GC_PROTECT(head);
       if (is(Fixed, head))
 	head= apply(get(head, Fixed,function), getTail(obj), ctx);
@@ -1651,8 +1720,14 @@ static subr(open)
 {
   oop arg= car(args);
   if (!is(String, arg)) { fprintf(stderr, "open: non-string argument: ");  fdumpln(stderr, arg);  fatal(0); }
-  FILE *stream= (FILE *)fopen(wcs2mbs(get(arg, String,bits)), "rb");
-  if (stream) fwide(stream, 1);
+  char *name= strdup(wcs2mbs(get(arg, String,bits)));
+  char *mode= "rb";
+  long  wide= 1;
+  if (is(String, cadr(args))) mode= wcs2mbs(get(cadr(args), String,bits));
+  if (is(Long, caddr(args))) wide= getLong(caddr(args));
+  FILE *stream= (FILE *)fopen(name, mode);
+  free(name);
+  if (stream) fwide(stream, wide);
   return stream ? newLong((long)stream) : nil;
 }
 
@@ -1664,6 +1739,16 @@ static subr(close)
   return arg;
 }
 
+static subr(getb)
+{
+  oop arg= car(args);
+  if (nil == arg) arg= get(input, Variable,value);
+  if (!isLong(arg)) { fprintf(stderr, "getb: non-integer argument: ");  fdumpln(stderr, arg);  fatal(0); }
+  FILE *stream= (FILE *)getLong(arg);
+  int c= getc(stream);
+  return (EOF == c) ? nil : newLong(c);
+}
+
 static subr(getc)
 {
   oop arg= car(args);
@@ -1671,7 +1756,31 @@ static subr(getc)
   if (!isLong(arg)) { fprintf(stderr, "getc: non-integer argument: ");  fdumpln(stderr, arg);  fatal(0); }
   FILE *stream= (FILE *)getLong(arg);
   int c= getwc(stream);
-  return (EOF == c) ? nil : newLong(c);
+  return (WEOF == c) ? nil : newLong(c);
+}
+
+static subr(putb)
+{
+  oop chr= car(args);
+  oop arg= cadr(args);
+  if (nil == arg) arg= get(output, Variable,value);
+  if (!isLong(chr)) { fprintf(stderr, "putb: non-integer character: ");  fdumpln(stderr, chr);  fatal(0); }
+  if (!isLong(arg)) { fprintf(stderr, "putb: non-integer argument: ");  fdumpln(stderr, arg);  fatal(0); }
+  FILE *stream= (FILE *)getLong(arg);
+  int c= putc(getLong(chr), stream);
+  return (EOF == c) ? nil : chr;
+}
+
+static subr(putc)
+{
+  oop chr= car(args);
+  oop arg= cadr(args);
+  if (nil == arg) arg= get(output, Variable,value);
+  if (!isLong(chr)) { fprintf(stderr, "putc: non-integer character: ");  fdumpln(stderr, chr);  fatal(0); }
+  if (!isLong(arg)) { fprintf(stderr, "putc: non-integer argument: ");  fdumpln(stderr, arg);  fatal(0); }
+  FILE *stream= (FILE *)getLong(arg);
+  int c= putwc(getLong(chr), stream);
+  return (WEOF == c) ? nil : chr;
 }
 
 static subr(read)
@@ -1923,12 +2032,45 @@ static subr(set_string_at)
   return val;
 }
 
-static subr(string_compare)
+static subr(string_copy)	// string from len
 {
-  arity2(args, "string-compare");
-  oop str= getHead(args);			if (!is(String, str)) { fprintf(stderr, "string-compare: non-string argument: ");  fdumpln(stderr, str);  fatal(0); }
-  oop arg= getHead(getTail(args));		if (!is(String, arg)) { fprintf(stderr, "string-compare: non-string argument: ");  fdumpln(stderr, arg);  fatal(0); }
-  return newLong(wcscmp(get(str, String,bits), get(arg, String,bits)));
+  oop str= car(args);			if (!is(String, str)) { fprintf(stderr, "string-copy: non-string argument: ");  fdumpln(stderr, str);  fatal(0); }
+  int ifr= 0;
+  int sln= stringLength(str);
+  oop ofr= cadr(args);
+  if (nil != ofr) {			if (!isLong(ofr)) { fprintf(stderr, "string-copy: non-integer start: ");  fdumpln(stderr, ofr);  fatal(0); }
+      ifr= getLong(ofr);
+      if (ifr < 0  ) ifr= 0;
+      if (ifr > sln) ifr= sln;		assert(ifr >= 0 && ifr <= sln);
+      sln -= ifr;			assert(sln >= 0);
+  }
+  oop oln= caddr(args);
+  if (nil != oln) {			if (!isLong(oln)) { fprintf(stderr, "string-copy: non-integer length: ");  fdumpln(stderr, oln);  fatal(0); }
+      int iln= getLong(oln);
+      if (iln < 0) iln= 0;
+      if (iln > sln) iln= sln;		assert(iln >= 0 && ifr + iln <= sln);
+      sln= iln;
+  }
+  return newStringN(get(str, String,bits) + ifr, sln);
+}
+
+static subr(string_compare)	// string substring offset=0 length=strlen(substring)
+{
+  oop str= car(args);			if (!is(String, str)) { fprintf(stderr, "string-compare: non-string argument: ");  fdumpln(stderr, str);  fatal(0); }
+  oop arg= cadr(args);			if (!is(String, arg)) { fprintf(stderr, "string-compare: non-string argument: ");  fdumpln(stderr, arg);  fatal(0); }
+  oop oof= caddr(args);
+  int off= 0;
+  if (nil != oof) {			if (!isLong(oof)) { fprintf(stderr, "string-compare: non-integer offset: ");  fdumpln(stderr, oof);  fatal(0); }
+      off= getLong(oof);
+  }
+  oop oln= cadddr(args);
+  int len= stringLength(str);
+  if (nil != oln) {			if (!isLong(oln)) { fprintf(stderr, "string-compare: non-integer length: ");  fdumpln(stderr, oln);  fatal(0); }
+      len= getLong(oln);
+  }
+  if (off < 0 || len < 0) return newLong(-1);
+  if (off >= stringLength(str)) return newLong(-1);
+  return newLong(wcsncmp(get(str, String,bits) + off, get(arg, String,bits), len));
 }
 
 static subr(symbol_compare)
@@ -2007,7 +2149,7 @@ static subr(array_length)
 {
   arity1(args, "array-length");
   oop arg= getHead(args);		if (!is(Array, arg)) { fprintf(stderr, "array-length: non-Array argument: ");  fdumpln(stderr, arg);  fatal(0); }
-  return newLong(arrayLength(arg));
+  return get(arg, Array,size);
 }
 
 static subr(array_at)
@@ -2027,11 +2169,48 @@ static subr(set_array_at)
   return arrayAtPut(arr, getLong(arg), val);
 }
 
+static subr(array_compare)	// array subarray offset=0 length=arrlen(subarray)
+{
+  oop arr= car(args);			if (!is(Array, arr)) { fprintf(stderr, "array-compare: non-array argument: ");  fdumpln(stderr, arr);  fatal(0); }
+  oop brr= cadr(args);			if (!is(Array, brr)) { fprintf(stderr, "array-compare: non-array argument: ");  fdumpln(stderr, brr);  fatal(0); }
+  int off= 0;
+  int len= 0;
+  int aln= arrayLength(arr);
+  int bln= arrayLength(brr);
+  oop oof= caddr(args);
+  if (nil != oof) {			if (!isLong(oof)) { fprintf(stderr, "array-compare: non-integer offset: ");  fdumpln(stderr, oof);  fatal(0); }
+      off= getLong(oof);
+      if (off < 0) off += aln;
+      if (off < 0 || off >= aln)	return newLong(-1);
+  }
+  oop oln= cadddr(args);
+  if (nil != oln) {			if (!isLong(oln)) { fprintf(stderr, "array-compare: non-integer length: ");  fdumpln(stderr, oln);  fatal(0); }
+      len= getLong(oln);
+      if (len < 0 || len > bln
+	  || off + len >= aln)		return newLong(-1);
+  }
+  else {
+      len= arrayLength(arr) - off;
+  }
+  long *aptr= (long *)get(arr, Array,_array) + off;
+  long *bptr= (long *)get(brr, Array,_array);
+  long  cmp = 0;
+  while (!cmp && len--) cmp= *aptr++ - *bptr++;
+  return newLong(cmp);
+}
+
 static subr(data)
 {
     oop arg= car(args);
     int num= isLong(arg) ? getLong(arg) : 0;
     return newData(num);
+}
+
+static subr(data_length)
+{
+  arity1(args, "data-length");
+  oop arg= getHead(args);		if (!is(Data, arg)) { fprintf(stderr, "data-length: non-Data argument: ");  fdumpln(stderr, arg);  fatal(0); }
+  return newLong(GC_size(arg));
 }
 
 #define accessor(name, type)										\
@@ -2068,7 +2247,9 @@ accessor(long,  long)
 
 #undef accessor
 
-static subr(call)
+#include <sys/mman.h>
+
+static subr(native_call)
 {
     oop  obj= car(args);
     struct { long l[34]; } argv;
@@ -2090,13 +2271,17 @@ static subr(call)
 	}
 	++argc;
     }
-    void *addr= 0;
+    void  *addr= 0;
+    size_t size= 0;
     switch (getType(obj))
     {
-	case Data:	addr= obj;			break;
-	case Long:	addr= (void *)getLong(obj);	break;
-	case Subr:	addr= get(obj, Subr,imp);	break;
+	case Data:	addr= obj;			size= GC_size(obj);	break;
+	case Long:	addr= (void *)getLong(obj);				break;
+	case Subr:	addr= get(obj, Subr,imp);				break;
 	default:	fatal("call: cannot call object of type %i", getType(obj));
+    }
+    if (size) {
+	if (mprotect(addr, size, PROT_READ | PROT_WRITE | PROT_EXEC)) perror("mprotect");
     }
     return newLong(((int (*)())addr)(argv));
 }
@@ -2112,13 +2297,19 @@ static subr(subr)
     switch (getType(ptr))
     {
 	case String:	name= get(ptr, String,bits);  break;
-	case Symbol:	name= (wchar_t *)ptr;  break;
+	case Symbol:	name= get(ptr, Symbol,bits);  break;
 	default:	fatal("subr: argument must be string or symbol");
     }
     char *sym= wcs2mbs(name);
     void *addr= dlsym(RTLD_DEFAULT, sym);
     if (!addr) fatal("could not find symbol: %s", sym);
     return newSubr(addr, name);
+}
+
+static subr(subr_name)
+{
+    oop arg= car(args);				if (!is(Subr, arg)) { fprintf(stderr, "subr-name: non-Subr argument: ");  fdumpln(stderr, arg);  fatal(0); }
+    return newString(get(arg, Subr,name));
 }
 
 static subr(allocate)
@@ -2159,6 +2350,15 @@ static subr(verbose)
   if (nil == obj) return newLong(opt_v);
   if (!isLong(obj)) return nil;
   opt_v= getLong(obj);
+  return obj;
+}
+
+static subr(optimised)
+{
+  oop obj= car(args);
+  if (nil == obj) return newLong(opt_O);
+  if (!isLong(obj)) return nil;
+  opt_O= getLong(obj);
   return obj;
 }
 
@@ -2208,6 +2408,33 @@ static subr(address_of)
 {
   oop arg= car(args);
   return newLong((long)arg);
+}
+
+#include <sys/time.h>
+#include <sys/resource.h>
+
+static struct timeval epoch;
+
+static void init_times(void)
+{
+    gettimeofday(&epoch, 0);
+}
+
+static subr(times)
+{
+    struct timeval tv;
+    struct rusage ru;
+    gettimeofday(&tv, 0);
+    getrusage(RUSAGE_SELF, &ru);
+    timersub(&tv, &epoch, &tv);
+    oop real= newLong(tv.tv_sec * 1000 + tv.tv_usec / 1000);			GC_PROTECT(real);
+    oop user= newLong(ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000);	GC_PROTECT(user);
+    oop syst= newLong(ru.ru_stime.tv_sec * 1000 + ru.ru_stime.tv_usec / 1000);	GC_PROTECT(syst);
+    syst= newPair(syst, nil);
+    user= newPair(user, syst);							GC_UNPROTECT(syst);
+    real= newPair(real, user);							GC_UNPROTECT(user);
+										GC_UNPROTECT(real);
+    return real;
 }
 
 #undef subr
@@ -2305,7 +2532,7 @@ static void sigvtalrm(int signo)
 
 static void profilingEnable(void)
 {
-    struct itimerval itv= { { 0, opt_p * 1000 }, { 0, opt_p * 1000 } };	/* VTALARM every opt_p mSecs */
+    struct itimerval itv= { { 0, opt_p }, { 0, opt_p } };	/* VTALARM every opt_p mSecs */
     setitimer(ITIMER_VIRTUAL, &itv, 0);
 }
 
@@ -2317,7 +2544,7 @@ static void profilingDisable(int stats)
     {
 	struct profile { int profile;  oop object, source; } profiles[64];
 	int nprofiles= 0;
-	printf("%i profiles\n", profilerCount);
+	fprintf(stderr, "%i profiles\n", profilerCount);
 	GC_gcollect();
 	oop obj;
 	for (obj= GC_first_object();  obj;  obj= GC_next_object(obj)) {
@@ -2349,11 +2576,11 @@ static void profilingDisable(int stats)
 	}
 	int i;
 	for (i= 0;  i < nprofiles;  ++i) {
-	    printf("%i\t", profiles[i].profile);
-	    int l= printSource(profiles[i].source);
-	    if (l < 20) printf("%*s", 20 - l, "");
-	    printf(" ");
-	    dumpln(profiles[i].object);
+	    fprintf(stderr, "%i\t", profiles[i].profile);
+	    int l= fprintSource(stderr, profiles[i].source);
+	    if (l < 20) fprintf(stderr, "%*s", 20 - l, "");
+	    fprintf(stderr, " ");
+	    fdumpln(stderr, profiles[i].object);
 	}
     }
 }
@@ -2362,6 +2589,8 @@ static void profilingDisable(int stats)
 
 int main(int argc, char **argv)
 {
+  init_times();
+
   if ((fwide(stdin, 1) <= 0) || (fwide(stdout, -1) >= 0) || (fwide(stderr, -1) >= 0)) {
     fprintf(stderr, "Cannot set stream widths.\n");
     return 1;
@@ -2394,6 +2623,8 @@ int main(int argc, char **argv)
   s_unquote_splicing	= intern(L"unquote-splicing");
   s_t			= intern(L"t");
   s_dot			= intern(L".");
+  s_bracket		= intern(L"bracket");
+  s_brace		= intern(L"brace");
 //s_in			= intern(L"in");
 
   oop tmp= nil;		GC_PROTECT(tmp);
@@ -2410,6 +2641,7 @@ int main(int argc, char **argv)
 
   backtrace=	define(get(globals, Variable,value), intern(L"*backtrace*"), nil);
   input=	define(get(globals, Variable,value), intern(L"*input*"), nil);
+  output=	define(get(globals, Variable,value), intern(L"*output*"), nil);
 
   currentPath= nil;			GC_add_root(&currentPath);
   currentLine= nil;			GC_add_root(&currentLine);
@@ -2436,7 +2668,10 @@ int main(int argc, char **argv)
 //    { " current-environment",	   subr_current_environment },
       { " open",	   subr_open },
       { " close",	   subr_close },
+      { " getb",	   subr_getb },
       { " getc",	   subr_getc },
+      { " putb",	   subr_putb },
+      { " putc",	   subr_putc },
       { " read",	   subr_read },
       { " expand",	   subr_expand },
       { " encode",	   subr_encode },
@@ -2462,6 +2697,7 @@ int main(int argc, char **argv)
       { " string-length",  subr_string_length },
       { " string-at",	   subr_string_at },
       { " set-string-at",  subr_set_string_at },
+      { " string-copy",    subr_string_copy },
       { " string-compare", subr_string_compare },
       { " symbol->string", subr_symbol_string },
       { " string->symbol", subr_string_symbol },
@@ -2477,22 +2713,27 @@ int main(int argc, char **argv)
       { " array-length",   subr_array_length },
       { " array-at",	   subr_array_at },
       { " set-array-at",   subr_set_array_at },
+      { " array-compare",  subr_array_compare },
       { " data",	   subr_data },
+      { " data-length",	   subr_data_length },
       { " byte-at",	   subr_byte_at },
       { " set-byte-at",    subr_set_byte_at },
       { " long-at",        subr_long_at },
       { " set-long-at",    subr_set_long_at },
-      { " call",	   subr_call },
+      { " native-call",	   subr_native_call },
       { " subr",	   subr_subr },
+      { " subr-name",	   subr_subr_name },
       { " allocate",	   subr_allocate },
       { " oop-at",	   subr_oop_at },
       { " set-oop-at",	   subr_set_oop_at },
       { " not",		   subr_not },
       { " verbose",	   subr_verbose },
+      { " optimised",	   subr_optimised },
       { " sin",		   subr_sin },
       { " cos",		   subr_cos },
       { " log",		   subr_log },
       { " address-of",	   subr_address_of },
+      { " times",	   subr_times },
       { 0,		   0 }
     };
     for (ptr= subrs;  ptr->name;  ++ptr) {
@@ -2540,12 +2781,13 @@ int main(int argc, char **argv)
     if 	    (!wcscmp (arg, L"-v"))	{ ++opt_v; }
     else if (!wcscmp (arg, L"-b"))	{ ++opt_b; }
     else if (!wcscmp (arg, L"-g"))	{ ++opt_g;  opt_p= 0; }
+    else if (!wcscmp (arg, L"-O"))	{ ++opt_O; }
 #  if (!LIB_GC)
     else if (!wcsncmp(arg, L"-p", 2)) {
 	opt_g= 0;
 	opt_p= wcstoul(arg + 2, 0, 0);
-	if (!opt_p) opt_p= 1;
-	printf("profiling every %i mSec(s)\n", opt_p);
+	if (!opt_p) opt_p= 1000;
+	printf("profiling every %i uSec(s)\n", opt_p);
     }
 #  endif
     else
@@ -2580,6 +2822,8 @@ int main(int argc, char **argv)
 	   GC_count_fragments() * 100.0);
 #endif
   }
+
+  set(output, Variable,value, newLong((long)stdout));
 
   if (!repled) {
     if (!opt_b) replPath(L"boot.l");

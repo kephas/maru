@@ -13,9 +13,9 @@
   (define-function data-stream-origin (self)		(address-of self.data))
   (define-function data-stream-address (self)		(+ (address-of self.data) self.position))
 
-  (define-function data-stream-grow (self)		(let ((lim (max 8 (* self.limit 2)))
-							      (old self.data)
-							      (big (data lim)))
+  (define-function data-stream-grow (self)		(let* ((lim (max 8 (* self.limit 2)))
+							       (old self.data)
+							       (big (data lim)))
 							  (for (i 0 self.limit) (set-byte-at big i (byte-at old i)))
 							  (set self.data  big)
 							  (set self.limit lim)
@@ -25,7 +25,7 @@
 
   (define-function data-stream-truncate (self)		(set self.limit self.position))
 
-  (define-function data-stream-rewind (self . rest)	(set self.position (if rest (car rest) 0)))
+  (define-function data-stream-rewind (self . rest)	(set self.position (or (car rest) 0)))
 
   (define-function data-stream-byte-at (self n)		(let ((i (+ self.position n)))
 							  (and (< i self.limit)
